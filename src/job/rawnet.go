@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-package jobs
+package job
 
 import (
 	"context"
@@ -35,6 +35,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/Arriven/db1000n/src/core/packetgen"
+	"github.com/Arriven/db1000n/src/job/config"
 	"github.com/Arriven/db1000n/src/utils"
 	"github.com/Arriven/db1000n/src/utils/metrics"
 	"github.com/Arriven/db1000n/src/utils/templates"
@@ -48,7 +49,7 @@ type rawnetConfig struct {
 	timeout   time.Duration
 }
 
-func tcpJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig, args Args) (data interface{}, err error) {
+func tcpJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig, args config.Args) (data interface{}, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -56,6 +57,8 @@ func tcpJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig,
 	if err != nil {
 		return nil, err
 	}
+
+	backoffController := utils.NewBackoffController(jobConfig.BackoffConfig)
 
 	if globalConfig.ProxyURLs != "" {
 		jobConfig.proxyURLs = templates.ParseAndExecute(logger, globalConfig.ProxyURLs, ctx)
@@ -72,13 +75,18 @@ func tcpJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig,
 	}
 
 	for jobConfig.Next(ctx) {
-		sendTCP(ctx, logger, jobConfig, trafficMonitor, processedTrafficMonitor)
+		err = sendTCP(ctx, logger, jobConfig, trafficMonitor, processedTrafficMonitor)
+		if err != nil {
+			utils.Sleep(ctx, backoffController.Increment().GetTimeout())
+		} else {
+			backoffController.Reset()
+		}
 	}
 
 	return nil, nil
 }
 
-func sendTCP(ctx context.Context, logger *zap.Logger, jobConfig *rawnetConfig, trafficMonitor, processedTrafficMonitor *metrics.Writer) {
+func sendTCP(ctx context.Context, logger *zap.Logger, jobConfig *rawnetConfig, trafficMonitor, processedTrafficMonitor *metrics.Writer) error {
 	// track sending of SYN packet
 	trafficMonitor.Add(packetgen.TCPHeaderSize + packetgen.IPHeaderSize)
 
@@ -87,7 +95,7 @@ func sendTCP(ctx context.Context, logger *zap.Logger, jobConfig *rawnetConfig, t
 		logger.Debug("error connecting via tcp", zap.String("addr", jobConfig.addr), zap.Error(err))
 		metrics.IncRawnetTCP(jobConfig.addr, metrics.StatusFail)
 
-		return
+		return err
 	}
 
 	defer conn.Close()
@@ -107,15 +115,17 @@ func sendTCP(ctx context.Context, logger *zap.Logger, jobConfig *rawnetConfig, t
 		if err != nil {
 			metrics.IncRawnetTCP(jobConfig.addr, metrics.StatusFail)
 
-			return
+			return err
 		}
 
 		processedTrafficMonitor.Add(uint64(n))
 		metrics.IncRawnetTCP(jobConfig.addr, metrics.StatusSuccess)
 	}
+
+	return nil
 }
 
-func udpJob(ctx context.Context, logger *zap.Logger, _ *GlobalConfig, args Args) (data interface{}, err error) {
+func udpJob(ctx context.Context, logger *zap.Logger, _ *GlobalConfig, args config.Args) (data interface{}, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -165,7 +175,7 @@ func sendUDP(ctx context.Context, logger *zap.Logger, a *net.UDPAddr, conn *net.
 	metrics.IncRawnetUDP(a.String(), metrics.StatusSuccess)
 }
 
-func parseRawNetJobArgs(ctx context.Context, logger *zap.Logger, args Args) (tpl *rawnetConfig, err error) {
+func parseRawNetJobArgs(ctx context.Context, logger *zap.Logger, args config.Args) (tpl *rawnetConfig, err error) {
 	var jobConfig struct {
 		BasicJobConfig
 

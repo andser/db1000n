@@ -20,8 +20,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Package jobs [contains all the attack types db1000n can simulate]
-package jobs
+// Package job [contains all the attack types db1000n can simulate]
+package job
 
 import (
 	"context"
@@ -31,11 +31,9 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/Arriven/db1000n/src/job/config"
 	"github.com/Arriven/db1000n/src/utils"
 )
-
-// Args comment for linter
-type Args = map[string]interface{}
 
 // GlobalConfig passes commandline arguments to every job.
 type GlobalConfig struct {
@@ -66,16 +64,7 @@ func NewGlobalConfigWithFlags() *GlobalConfig {
 }
 
 // Job comment for linter
-type Job = func(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig, args Args) (data interface{}, err error)
-
-// Config comment for linter
-type Config struct {
-	Name   string `mapstructure:"name"`
-	Type   string `mapstructure:"type"`
-	Count  int    `mapstructure:"count"`
-	Filter string `mapstructure:"filter"`
-	Args   Args   `mapstructure:"args"`
-}
+type Job = func(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig, args config.Args) (data interface{}, err error)
 
 // Get job by type name
 //nolint:cyclop // The string map alternative is orders of magnitude slower
@@ -117,23 +106,11 @@ func Get(t string) Job {
 // BasicJobConfig comment for linter
 type BasicJobConfig struct {
 	IntervalMs int `mapstructure:"interval_ms,omitempty"`
-	Count      int `mapstructure:"count,omitempty"`
-
-	iter int
+	utils.Counter
+	*utils.BackoffConfig
 }
 
 // Next comment for linter
 func (c *BasicJobConfig) Next(ctx context.Context) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(time.Duration(c.IntervalMs) * time.Millisecond):
-		if c.Count <= 0 {
-			return true
-		}
-
-		c.iter++
-
-		return c.iter <= c.Count
-	}
+	return utils.Sleep(ctx, time.Duration(c.IntervalMs)*time.Millisecond) && c.Counter.Next()
 }

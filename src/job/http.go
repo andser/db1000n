@@ -20,11 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-package jobs
+package job
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -34,6 +33,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/Arriven/db1000n/src/core/http"
+	"github.com/Arriven/db1000n/src/job/config"
 	"github.com/Arriven/db1000n/src/utils"
 	"github.com/Arriven/db1000n/src/utils/metrics"
 	"github.com/Arriven/db1000n/src/utils/templates"
@@ -46,7 +46,7 @@ type httpJobConfig struct {
 	Client  map[string]interface{} // See HTTPClientConfig
 }
 
-func singleRequestJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig, args Args) (data interface{}, err error) {
+func singleRequestJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig, args config.Args) (data interface{}, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -121,7 +121,7 @@ func cookieLoaderFunc(cookies map[string]string, logger *zap.Logger) func(key []
 	}
 }
 
-func fastHTTPJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig, args Args) (data interface{}, err error) {
+func fastHTTPJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalConfig, args config.Args) (data interface{}, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -129,6 +129,8 @@ func fastHTTPJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalCo
 	if err != nil {
 		return nil, err
 	}
+
+	backoffController := utils.NewBackoffController(jobConfig.BackoffConfig)
 
 	client := http.NewClient(ctx, *clientConfig, logger)
 
@@ -156,20 +158,18 @@ func fastHTTPJob(ctx context.Context, logger *zap.Logger, globalConfig *GlobalCo
 		trafficMonitor.Add(uint64(dataSize))
 
 		if err := sendFastHTTPRequest(client, req, nil); err != nil {
-			if errors.Is(err, fasthttp.ErrHostClientRedirectToDifferentScheme) {
-				return nil, err
-			}
-
 			logger.Debug("error sending request", zap.Error(err), zap.Any("args", args))
+			utils.Sleep(ctx, backoffController.Increment().GetTimeout())
 		} else {
 			processedTrafficMonitor.Add(uint64(dataSize))
+			backoffController.Reset()
 		}
 	}
 
 	return nil, nil
 }
 
-func getHTTPJobConfigs(ctx context.Context, args Args, globalProxyURLs string, logger *zap.Logger) (
+func getHTTPJobConfigs(ctx context.Context, args config.Args, globalProxyURLs string, logger *zap.Logger) (
 	cfg *httpJobConfig, clientCfg *http.ClientConfig, requestTpl *templates.MapStruct, err error,
 ) {
 	var jobConfig httpJobConfig
