@@ -2,11 +2,7 @@ name: PushToGithubPages
 
 on:
   push:
-    branches:
-      - master
-      - main
     tags: ["**"]
-  workflow_dispatch:
 
 jobs:
   deploy:
