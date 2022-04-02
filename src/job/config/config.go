@@ -38,7 +38,7 @@ import (
 )
 
 // Args is a generic arguments map.
-type Args = map[string]interface{}
+type Args = map[string]any
 
 // Config for a single job.
 type Config struct {
@@ -92,6 +92,10 @@ func fetchSingle(path string, lastKnownConfig *RawMultiConfig) (*RawMultiConfig,
 		return &RawMultiConfig{Body: res, lastModified: "", etag: ""}, nil
 	}
 
+	return fetchURL(configURL, lastKnownConfig)
+}
+
+func fetchURL(configURL *url.URL, lastKnownConfig *RawMultiConfig) (*RawMultiConfig, error) {
 	const requestTimeout = 20 * time.Second
 
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
@@ -102,8 +106,13 @@ func fetchSingle(path string, lastKnownConfig *RawMultiConfig) (*RawMultiConfig,
 		return nil, err
 	}
 
-	req.Header.Add("If-None-Match", lastKnownConfig.etag)
-	req.Header.Add("If-Modified-Since", lastKnownConfig.lastModified)
+	if lastKnownConfig.etag != "" {
+		req.Header.Add("If-None-Match", lastKnownConfig.etag)
+	}
+
+	if lastKnownConfig.lastModified != "" {
+		req.Header.Add("If-Modified-Since", lastKnownConfig.lastModified)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
