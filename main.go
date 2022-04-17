@@ -81,6 +81,11 @@ func main() {
 		log.Fatalf("failed to initialize Zap logger: %v", err)
 	}
 
+	err = utils.UpdateRLimit(logger)
+	if err != nil {
+		logger.Warn("failed to increase rlimit", zap.Error(err))
+	}
+
 	go ota.WatchUpdates(otaConfig)
 	setUpPprof(*pprof, *debug)
 	rand.Seed(time.Now().UnixNano())
@@ -92,13 +97,8 @@ func main() {
 
 	metrics.InitOrFail(ctx, logger, *prometheusOn, *prometheusPushGateways, jobsGlobalConfig.ClientID, country)
 
-	r, err := job.NewRunner(runnerConfigOptions, jobsGlobalConfig)
-	if err != nil {
-		log.Panicf("Error initializing runner: %v", err)
-	}
-
 	go cancelOnSignal(cancel)
-	r.Run(ctx, logger)
+	job.NewRunner(runnerConfigOptions, jobsGlobalConfig).Run(ctx, logger)
 }
 
 func newZapLogger(debug bool) (*zap.Logger, error) {

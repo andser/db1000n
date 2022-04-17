@@ -23,6 +23,7 @@
 package packetgen
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -40,7 +41,7 @@ type ConnectionConfig struct {
 	Args map[string]any
 }
 
-func OpenConnection(c ConnectionConfig) (Connection, error) {
+func OpenConnection(ctx context.Context, c ConnectionConfig) (Connection, error) {
 	switch c.Type {
 	case "raw":
 		var cfg rawConnConfig
@@ -55,7 +56,7 @@ func OpenConnection(c ConnectionConfig) (Connection, error) {
 			return nil, fmt.Errorf("error decoding connection config: %w", err)
 		}
 
-		return openNetConn(cfg)
+		return openNetConn(ctx, cfg)
 	default:
 		return nil, fmt.Errorf("unknown connection type: %v", c.Type)
 	}
@@ -63,6 +64,8 @@ func OpenConnection(c ConnectionConfig) (Connection, error) {
 
 type Connection interface {
 	Write(Packet) (int, error)
+	Close() error
+	Target() string
 }
 
 // raw ipv4/ipv6 connection
@@ -73,6 +76,9 @@ type rawConnConfig struct {
 
 type rawConn struct {
 	*ipv6.PacketConn
+	buf gopacket.SerializeBuffer
+
+	target string
 }
 
 // openRawConn opens a raw ip network connection based on the provided config
@@ -83,18 +89,26 @@ func openRawConn(c rawConnConfig) (*rawConn, error) {
 		return nil, err
 	}
 
-	return &rawConn{PacketConn: ipv6.NewPacketConn(packetConn)}, err
+	return &rawConn{
+		PacketConn: ipv6.NewPacketConn(packetConn),
+		buf:        gopacket.NewSerializeBuffer(),
+		target:     c.Name + "://" + c.Address,
+	}, nil
 }
 
-func (conn rawConn) Write(packet Packet) (n int, err error) {
-	payloadBuf := gopacket.NewSerializeBuffer()
-
-	if err = packet.Serialize(payloadBuf); err != nil {
+func (conn *rawConn) Write(packet Packet) (n int, err error) {
+	if err := packet.Serialize(conn.buf); err != nil {
 		return 0, fmt.Errorf("error serializing packet: %w", err)
 	}
 
-	return conn.PacketConn.WriteTo(payloadBuf.Bytes(), nil, &net.IPAddr{IP: packet.IP()})
+	return conn.PacketConn.WriteTo(conn.buf.Bytes(), nil, &net.IPAddr{IP: packet.IP()})
 }
+
+func (conn *rawConn) Close() error {
+	return conn.PacketConn.Close()
+}
+
+func (conn *rawConn) Target() string { return conn.target }
 
 type netConnConfig struct {
 	Protocol        string
@@ -106,31 +120,62 @@ type netConnConfig struct {
 
 type netConn struct {
 	net.Conn
+	buf gopacket.SerializeBuffer
+
+	target string
 }
 
-func openNetConn(c netConnConfig) (*netConn, error) {
+func readStub(ctx context.Context, conn net.Conn) {
+	const bufSize = 1024
+	buf := make([]byte, bufSize)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			_, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
+func openNetConn(ctx context.Context, c netConnConfig) (*netConn, error) {
 	conn, err := utils.GetProxyFunc(c.ProxyURLs, c.Timeout, false)(c.Protocol, c.Address)
 
-	if c.TLSClientConfig != nil {
-		tlsConn := tls.Client(conn, c.TLSClientConfig)
-		if err := tlsConn.Handshake(); err != nil {
-			tlsConn.Close()
+	switch {
+	case err != nil:
+		return nil, err
+	case c.TLSClientConfig == nil:
+		go readStub(ctx, conn)
 
-			return nil, err
-		}
-
-		return &netConn{Conn: tlsConn}, err
+		return &netConn{Conn: conn, buf: gopacket.NewSerializeBuffer(), target: c.Protocol + "://" + c.Address}, nil
 	}
 
-	return &netConn{Conn: conn}, err
+	tlsConn := tls.Client(conn, c.TLSClientConfig)
+	if err = tlsConn.Handshake(); err != nil {
+		tlsConn.Close()
+
+		return nil, err
+	}
+
+	go readStub(ctx, tlsConn)
+
+	return &netConn{Conn: tlsConn, buf: gopacket.NewSerializeBuffer(), target: c.Protocol + "://" + c.Address}, nil
 }
 
-func (conn netConn) Write(packet Packet) (n int, err error) {
-	payloadBuf := gopacket.NewSerializeBuffer()
-
-	if err = packet.Serialize(payloadBuf); err != nil {
+func (conn *netConn) Write(packet Packet) (n int, err error) {
+	if err = packet.Serialize(conn.buf); err != nil {
 		return 0, fmt.Errorf("error serializing packet: %w", err)
 	}
 
-	return conn.Conn.Write(payloadBuf.Bytes())
+	return conn.Conn.Write(conn.buf.Bytes())
 }
+
+func (conn *netConn) Close() error {
+	return conn.Conn.Close()
+}
+
+func (conn *netConn) Target() string { return conn.target }
