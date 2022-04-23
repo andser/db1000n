@@ -25,7 +25,6 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
 	"math/rand"
 	"net/http"
 	pprofhttp "net/http/pprof"
@@ -46,22 +45,26 @@ import (
 )
 
 func main() {
-	log.SetOutput(os.Stdout)
-	log.SetFlags(log.Ldate | log.Lmicroseconds | log.Lshortfile | log.LUTC)
-	log.Printf("DB1000n [Version: %s][PID=%d]\n", ota.Version, os.Getpid())
-
 	runnerConfigOptions := job.NewConfigOptionsWithFlags()
 	jobsGlobalConfig := job.NewGlobalConfigWithFlags()
 	otaConfig := ota.NewConfigWithFlags()
 	countryCheckerConfig := utils.NewCountryCheckerConfigWithFlags()
 	updaterMode, destinationPath := config.NewUpdaterOptionsWithFlags()
-	prometheusOn, prometheusPushGateways := metrics.NewOptionsWithFlags()
+	prometheusOn, prometheusListenAddress, prometheusPushGateways := metrics.NewOptionsWithFlags()
 	pprof := flag.String("pprof", utils.GetEnvStringDefault("GO_PPROF_ENDPOINT", ""), "enable pprof")
 	help := flag.Bool("h", false, "print help message and exit")
 	version := flag.Bool("version", false, "print version and exit")
-	debug := flag.Bool("debug", utils.GetEnvBoolDefault("DEBUG", false), "enable debug level logging")
+	debug := flag.Bool("debug", utils.GetEnvBoolDefault("DEBUG", false), "enable debug level logging and features")
+	logLevel := flag.String("log-level", utils.GetEnvStringDefault("LOG_LEVEL", "none"), "log level override for zap, leave empty to use default")
 
 	flag.Parse()
+
+	logger, err := newZapLogger(*debug, *logLevel)
+	if err != nil {
+		panic(err)
+	}
+
+	logger.Info("running db1000n", zap.String("version", ota.Version), zap.Int("pid", os.Getpid()))
 
 	switch {
 	case *help:
@@ -71,14 +74,9 @@ func main() {
 	case *version:
 		return
 	case *updaterMode:
-		config.UpdateLocal(*destinationPath, strings.Split(runnerConfigOptions.PathsCSV, ","), []byte(runnerConfigOptions.BackupConfig))
+		config.UpdateLocal(logger, *destinationPath, strings.Split(runnerConfigOptions.PathsCSV, ","), []byte(runnerConfigOptions.BackupConfig))
 
 		return
-	}
-
-	logger, err := newZapLogger(*debug)
-	if err != nil {
-		log.Fatalf("failed to initialize Zap logger: %v", err)
 	}
 
 	err = utils.UpdateRLimit(logger)
@@ -86,30 +84,36 @@ func main() {
 		logger.Warn("failed to increase rlimit", zap.Error(err))
 	}
 
-	go ota.WatchUpdates(otaConfig)
-	setUpPprof(*pprof, *debug)
+	go ota.WatchUpdates(logger, otaConfig)
+	setUpPprof(logger, *pprof, *debug)
 	rand.Seed(time.Now().UnixNano())
 
-	country := utils.CheckCountryOrFail(countryCheckerConfig, templates.ParseAndExecute(zap.NewNop(), jobsGlobalConfig.ProxyURLs, nil))
+	country := utils.CheckCountryOrFail(logger, countryCheckerConfig, templates.ParseAndExecute(logger, jobsGlobalConfig.ProxyURLs, nil))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	metrics.InitOrFail(ctx, logger, *prometheusOn, *prometheusPushGateways, jobsGlobalConfig.ClientID, country)
+	metrics.InitOrFail(ctx, logger, *prometheusOn, *prometheusListenAddress, *prometheusPushGateways, jobsGlobalConfig.ClientID, country)
 
-	go cancelOnSignal(cancel)
+	go cancelOnSignal(logger, cancel)
 	job.NewRunner(runnerConfigOptions, jobsGlobalConfig).Run(ctx, logger)
 }
 
-func newZapLogger(debug bool) (*zap.Logger, error) {
+func newZapLogger(debug bool, logLevel string) (*zap.Logger, error) {
+	cfg := zap.NewProductionConfig()
 	if debug {
-		return zap.NewDevelopment()
+		cfg = zap.NewDevelopmentConfig()
 	}
 
-	return zap.NewProduction()
+	level, err := zap.ParseAtomicLevel(logLevel)
+	if err == nil {
+		cfg.Level = level
+	}
+
+	return cfg.Build()
 }
 
-func setUpPprof(pprof string, debug bool) {
+func setUpPprof(logger *zap.Logger, pprof string, debug bool) {
 	switch {
 	case debug && pprof == "":
 		pprof = ":8080"
@@ -124,11 +128,11 @@ func setUpPprof(pprof string, debug bool) {
 	mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprofhttp.Symbol))
 	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprofhttp.Trace))
 
-	// this has to be wrapped into a lambda bc otherwise it blocks when evaluating argument for log.Println
-	go func() { log.Println(http.ListenAndServe(pprof, mux)) }()
+	// this has to be wrapped into a lambda bc otherwise it blocks when evaluating argument for zap.Error
+	go func() { logger.Warn("pprof server", zap.Error(http.ListenAndServe(pprof, mux))) }()
 }
 
-func cancelOnSignal(cancel context.CancelFunc) {
+func cancelOnSignal(logger *zap.Logger, cancel context.CancelFunc) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs,
 		syscall.SIGTERM,
@@ -137,6 +141,6 @@ func cancelOnSignal(cancel context.CancelFunc) {
 		syscall.SIGINT,
 	)
 	<-sigs
-	log.Println("Terminating")
+	logger.Info("terminating")
 	cancel()
 }

@@ -5,8 +5,10 @@ package metrics
 
 import (
 	"context"
+
+	"go.uber.org/zap"
 )
 
-func serveMetrics(ctx context.Context) {
+func serveMetrics(ctx context.Context, logger *zap.Logger, listen string) {
 	<-ctx.Done()
 }

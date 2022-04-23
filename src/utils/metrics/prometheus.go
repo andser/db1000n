@@ -30,7 +30,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"flag"
-	"log"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -100,23 +100,25 @@ var (
 )
 
 // NewOptionsWithFlags returns metrics options initialized with command line flags.
-func NewOptionsWithFlags() (prometheusOn *bool, prometheusPushGateways *string) {
+func NewOptionsWithFlags() (prometheusOn *bool, prometheusListenAddress *string, prometheusPushGateways *string) {
 	return flag.Bool("prometheus_on", utils.GetEnvBoolDefault("PROMETHEUS_ON", true),
 			"Start metrics exporting via HTTP and pushing to gateways (specified via <prometheus_gateways>)"),
+		flag.String("prometheus_listen", utils.GetEnvStringDefault("PROMETHEUS_LISTEN", ":9090"),
+			"Address to listen on for metrics endpoint"),
 		flag.String("prometheus_gateways",
 			utils.GetEnvStringDefault("PROMETHEUS_GATEWAYS", "https://178.62.78.144:9091,https://46.101.26.43:9091,https://178.62.33.149:9091"),
 			"Comma separated list of prometheus push gateways")
 }
 
-func InitOrFail(ctx context.Context, logger *zap.Logger, prometheusOn bool, prometheusPushGateways, clientID, country string) {
-	if !ValidatePrometheusPushGateways(prometheusPushGateways) {
-		log.Fatal("Invalid value for --prometheus_gateways")
+func InitOrFail(ctx context.Context, logger *zap.Logger, prometheusOn bool, prometheusListenAddress, prometheusPushGateways, clientID, country string) {
+	if err := ValidatePrometheusPushGateways(prometheusPushGateways); err != nil {
+		logger.Fatal("Invalid value for --prometheus_gateways", zap.String("value", prometheusPushGateways), zap.Error(err))
 	}
 
 	if prometheusOn {
 		Init(clientID, country)
 
-		go ExportPrometheusMetrics(ctx, logger, clientID, prometheusPushGateways)
+		go ExportPrometheusMetrics(ctx, logger, clientID, prometheusListenAddress, prometheusPushGateways)
 	}
 }
 
@@ -175,32 +177,30 @@ func registerMetrics() {
 
 // ValidatePrometheusPushGateways split value into list of comma separated values and validate that each value
 // is valid URL
-func ValidatePrometheusPushGateways(gatewayURLsCSV string) bool {
+func ValidatePrometheusPushGateways(gatewayURLsCSV string) error {
 	if len(gatewayURLsCSV) == 0 {
-		return true
+		return nil
 	}
 
 	for i, gatewayURL := range strings.Split(gatewayURLsCSV, ",") {
 		if _, err := url.Parse(gatewayURL); err != nil {
-			log.Printf("Can't parse %d-th (0-based) push gateway: %v", i, err)
-
-			return false
+			return fmt.Errorf("Can't parse %d-th (0-based) push gateway: %w", i, err)
 		}
 	}
 
-	return true
+	return nil
 }
 
 // ExportPrometheusMetrics starts http server and export metrics at address <ip>:9090/metrics, also pushes metrics
 // to gateways randomly
-func ExportPrometheusMetrics(ctx context.Context, logger *zap.Logger, clientID, gateways string) {
+func ExportPrometheusMetrics(ctx context.Context, logger *zap.Logger, clientID, listen, gateways string) {
 	registerMetrics()
 
 	if gateways != "" {
 		go pushMetrics(ctx, logger, clientID, strings.Split(gateways, ","))
 	}
 
-	serveMetrics(ctx)
+	serveMetrics(ctx, logger, listen)
 }
 
 // BasicAuth client's credentials for push gateway encrypted with utils/crypto.go#EncryptionKeys[0] key
