@@ -28,6 +28,7 @@ import (
 	"sync"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // Stat is the type of statistical metrics.
@@ -72,7 +73,7 @@ func NewReporter(clientID string) *Reporter { return &Reporter{clientID: clientI
 func (r *Reporter) Sum(s Stat) uint64 {
 	var res uint64
 
-	r.metrics[s].Range(func(_, v interface{}) bool {
+	r.metrics[s].Range(func(_, v any) bool {
 		value, ok := v.(uint64)
 		if !ok {
 			return true
@@ -94,11 +95,6 @@ type (
 	// PerTargetStats is a map of Stats per target.
 	PerTargetStats map[string]Stats
 )
-
-// NewStats returns a new Stats record.
-func NewStats(requestsAttempted, requestsSent, responsesReceived, bytesSent uint64) Stats {
-	return Stats{requestsAttempted, requestsSent, responsesReceived, bytesSent}
-}
 
 // Sum up all Stats into a total Stats record.
 func (s MultiStats) Sum() Stats {
@@ -139,7 +135,7 @@ func (r *Reporter) SumAllStatsByTarget() PerTargetStats {
 	res := make(PerTargetStats)
 
 	for s := RequestsAttemptedStat; s < NumStats; s++ {
-		r.metrics[s].Range(func(k, v interface{}) bool {
+		r.metrics[s].Range(func(k, v any) bool {
 			d, ok := k.(dimensions)
 			if !ok {
 				return true
@@ -167,24 +163,34 @@ func (r *Reporter) WriteSummary(logger *zap.Logger) {
 
 	var totals Stats
 
-	for _, tgt := range stats.sortedTargets() {
-		tgtStats := stats[tgt]
-		logger.Info("stats", zap.String("target", tgt),
-			zap.Uint64("requests_attempted", tgtStats[RequestsAttemptedStat]),
-			zap.Uint64("requests_sent", tgtStats[RequestsSentStat]),
-			zap.Uint64("responses_received", tgtStats[ResponsesReceivedStat]),
-			zap.Uint64("bytes_sent", tgtStats[BytesSentStat]))
+	for s := RequestsAttemptedStat; s < NumStats; s++ {
+		totals[s] = r.Sum(s)
+	}
 
-		for s := range totals {
-			totals[s] += tgtStats[s]
+	logger.Info("stats", zap.Object("total", &totals), zap.Object("targets", stats))
+}
+
+// MarshalLogObject is required to log PerTargetStats objects to zap above
+func (ts PerTargetStats) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	for _, tgt := range ts.sortedTargets() {
+		tgtStats := ts[tgt]
+
+		if err := enc.AddObject(tgt, &tgtStats); err != nil {
+			return err
 		}
 	}
 
-	logger.Info("stats", zap.String("target", "total"),
-		zap.Uint64("requests_attempted", totals[RequestsAttemptedStat]),
-		zap.Uint64("requests_sent", totals[RequestsSentStat]),
-		zap.Uint64("responses_received", totals[ResponsesReceivedStat]),
-		zap.Uint64("bytes_sent", totals[BytesSentStat]))
+	return nil
+}
+
+// MarshalLogObject is required to log Stats objects to zap above
+func (stats *Stats) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddUint64("requests_attempted", stats[RequestsAttemptedStat])
+	enc.AddUint64("requests_sent", stats[RequestsSentStat])
+	enc.AddUint64("responses_received", stats[ResponsesReceivedStat])
+	enc.AddUint64("bytes_sent", stats[BytesSentStat])
+
+	return nil
 }
 
 // NewAccumulator returns a new metrics Accumulator for the Reporter.
@@ -214,15 +220,6 @@ func (a *Accumulator) Add(target string, s Stat, n uint64) *Accumulator {
 
 // Inc increases Accumulator Stat value by 1. Returns self for chaining.
 func (a *Accumulator) Inc(target string, s Stat) *Accumulator { return a.Add(target, s, 1) }
-
-// AddStats to the Accumulator. Returns self for chaining.
-func (a *Accumulator) AddStats(target string, s Stats) *Accumulator {
-	for i := range a.metrics {
-		a.metrics[i][target] += s[i]
-	}
-
-	return a
-}
 
 // Flush Accumulator contents to the Reporter.
 func (a *Accumulator) Flush() {
