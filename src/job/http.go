@@ -40,10 +40,12 @@ import (
 type httpJobConfig struct {
 	BasicJobConfig
 
+	Dynamic bool
 	Request map[string]any
 	Client  map[string]any // See HTTPClientConfig
 }
 
+// "http-request" in config
 func singleRequestJob(ctx context.Context, args config.Args, globalConfig *GlobalConfig, a *metrics.Accumulator, logger *zap.Logger) (data any, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -70,7 +72,7 @@ func singleRequestJob(ctx context.Context, args config.Args, globalConfig *Globa
 
 	http.InitRequest(requestConfig, req)
 
-	if err = sendFastHTTPRequest(client, req, resp); err != nil {
+	if err = client.Do(req, resp); err != nil {
 		if a != nil {
 			a.Inc(target(req.URI()), metrics.RequestsAttemptedStat).Flush()
 		}
@@ -131,6 +133,7 @@ func cookieLoaderFunc(cookies map[string]string, logger *zap.Logger) func(key []
 	}
 }
 
+// "http" or "http-flood" in config
 func fastHTTPJob(ctx context.Context, args config.Args, globalConfig *GlobalConfig, a *metrics.Accumulator, logger *zap.Logger) (data any, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -143,29 +146,30 @@ func fastHTTPJob(ctx context.Context, args config.Args, globalConfig *GlobalConf
 	backoffController := utils.BackoffController{BackoffConfig: utils.NonNilOrDefault(jobConfig.Backoff, globalConfig.Backoff)}
 	client := http.NewClient(ctx, *clientConfig, logger)
 
-	req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
-	defer func() {
-		fasthttp.ReleaseRequest(req)
-		fasthttp.ReleaseResponse(resp)
-	}()
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
 
-	resp.SkipBody = true
+	if !jobConfig.Dynamic {
+		if err := buildHTTPRequest(ctx, logger, requestTpl, req); err != nil {
+			return nil, fmt.Errorf("error executing request template: %w", err)
+		}
+	}
 
 	logger.Info("attacking", zap.Any("target", jobConfig.Request["path"]))
 
 	for jobConfig.Next(ctx) {
-		var requestConfig http.RequestConfig
-		if err := utils.Decode(requestTpl.Execute(logger, ctx), &requestConfig); err != nil {
-			return nil, fmt.Errorf("error executing request template: %w", err)
+		if jobConfig.Dynamic {
+			if err := buildHTTPRequest(ctx, logger, requestTpl, req); err != nil {
+				return nil, fmt.Errorf("error executing request template: %w", err)
+			}
 		}
 
-		http.InitRequest(requestConfig, req)
-
-		if err := sendFastHTTPRequest(client, req, resp); err != nil {
+		if err := client.Do(req, nil); err != nil {
 			logger.Debug("error sending request", zap.Error(err), zap.Any("args", args))
 
 			if a != nil {
 				a.Inc(target(req.URI()), metrics.RequestsAttemptedStat).Flush()
+				metrics.IncHTTP(string(req.Host()), string(req.Header.Method()), metrics.StatusFail)
 			}
 
 			utils.Sleep(ctx, backoffController.Increment().GetTimeout())
@@ -183,12 +187,25 @@ func fastHTTPJob(ctx context.Context, args config.Args, globalConfig *GlobalConf
 				Inc(tgt, metrics.ResponsesReceivedStat).
 				Add(tgt, metrics.BytesSentStat, uint64(requestSize)).
 				Flush()
+
+			metrics.IncHTTP(string(req.Host()), string(req.Header.Method()), metrics.StatusSuccess)
 		}
 
 		backoffController.Reset()
 	}
 
 	return nil, nil
+}
+
+func buildHTTPRequest(ctx context.Context, logger *zap.Logger, requestTpl *templates.MapStruct, req *fasthttp.Request) error {
+	var requestConfig http.RequestConfig
+	if err := utils.Decode(requestTpl.Execute(logger, ctx), &requestConfig); err != nil {
+		return fmt.Errorf("error executing request template: %w", err)
+	}
+
+	http.InitRequest(requestConfig, req)
+
+	return nil
 }
 
 func target(uri *fasthttp.URI) string { return string(uri.Scheme()) + "://" + string(uri.Host()) }
@@ -206,17 +223,8 @@ func getHTTPJobConfigs(ctx context.Context, args config.Args, global GlobalConfi
 		return nil, nil, nil, fmt.Errorf("error parsing client config: %w", err)
 	}
 
-	if global.ProxyURLs != "" {
-		clientConfig.ProxyURLs = templates.ParseAndExecute(logger, global.ProxyURLs, ctx)
-	}
-
-	if global.LocalAddr != "" {
-		clientConfig.LocalAddr = templates.ParseAndExecute(logger, global.LocalAddr, ctx)
-	}
-
-	if global.Interface != "" {
-		clientConfig.Interface = templates.ParseAndExecute(logger, global.Interface, ctx)
-	}
+	proxyCfg := utils.NonNilOrDefault(clientConfig.Proxy, global.GetProxyParams(logger, ctx))
+	clientConfig.Proxy = &proxyCfg
 
 	requestTpl, err = templates.ParseMapStruct(jobConfig.Request)
 	if err != nil {
@@ -224,18 +232,6 @@ func getHTTPJobConfigs(ctx context.Context, args config.Args, global GlobalConfi
 	}
 
 	return &jobConfig, &clientConfig, requestTpl, nil
-}
-
-func sendFastHTTPRequest(client http.Client, req *fasthttp.Request, resp *fasthttp.Response) error {
-	if err := client.Do(req, resp); err != nil {
-		metrics.IncHTTP(string(req.Host()), string(req.Header.Method()), metrics.StatusFail)
-
-		return err
-	}
-
-	metrics.IncHTTP(string(req.Host()), string(req.Header.Method()), metrics.StatusSuccess)
-
-	return nil
 }
 
 // nopWriter implements io.Writer interface to simply track how much data has to be serialized

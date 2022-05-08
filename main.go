@@ -29,19 +29,17 @@ import (
 	"net/http"
 	pprofhttp "net/http/pprof"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/Arriven/db1000n/src/job"
 	"github.com/Arriven/db1000n/src/job/config"
 	"github.com/Arriven/db1000n/src/utils"
 	"github.com/Arriven/db1000n/src/utils/metrics"
 	"github.com/Arriven/db1000n/src/utils/ota"
-	"github.com/Arriven/db1000n/src/utils/templates"
 )
 
 const simpleLogFormat = "simple"
@@ -52,7 +50,7 @@ func main() {
 	otaConfig := ota.NewConfigWithFlags()
 	countryCheckerConfig := utils.NewCountryCheckerConfigWithFlags()
 	updaterMode, destinationPath := config.NewUpdaterOptionsWithFlags()
-	prometheusOn, prometheusListenAddress, prometheusPushGateways := metrics.NewOptionsWithFlags()
+	prometheusOn, prometheusListenAddress := metrics.NewOptionsWithFlags()
 	pprof := flag.String("pprof", utils.GetEnvStringDefault("GO_PPROF_ENDPOINT", ""), "enable pprof")
 	help := flag.Bool("h", false, "print help message and exit")
 	version := flag.Bool("version", false, "print version and exit")
@@ -93,14 +91,12 @@ func main() {
 	setUpPprof(logger, *pprof, *debug)
 	rand.Seed(time.Now().UnixNano())
 
-	country := utils.CheckCountryOrFail(logger, countryCheckerConfig, templates.ParseAndExecute(logger, jobsGlobalConfig.ProxyURLs, nil))
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	metrics.InitOrFail(ctx, logger, *prometheusOn, *prometheusListenAddress, *prometheusPushGateways, jobsGlobalConfig.ClientID, country)
+	country := utils.CheckCountryOrFail(ctx, logger, countryCheckerConfig, jobsGlobalConfig.GetProxyParams(logger, nil))
 
-	go cancelOnSignal(logger, cancel)
+	metrics.InitOrFail(ctx, logger, *prometheusOn, *prometheusListenAddress, jobsGlobalConfig.ClientID, country)
 
 	reporter := newReporter(*logFormat, logger)
 	job.NewRunner(runnerConfigOptions, jobsGlobalConfig, reporter).Run(ctx, logger)
@@ -113,9 +109,8 @@ func newZapLogger(debug bool, logLevel string, logFormat string) (*zap.Logger, e
 	}
 
 	if logFormat == simpleLogFormat {
-		// turn off all output except the message itself
+		// turn off all output except the message itself and log level
 		cfg.Encoding = "console"
-		cfg.EncoderConfig.LevelKey = ""
 		cfg.EncoderConfig.TimeKey = ""
 		cfg.EncoderConfig.NameKey = ""
 
@@ -126,6 +121,10 @@ func newZapLogger(debug bool, logLevel string, logFormat string) (*zap.Logger, e
 		}
 	} else if logFormat != "" {
 		cfg.Encoding = logFormat
+
+		if logFormat == "console" {
+			cfg.EncoderConfig.EncodeTime = zapcore.RFC3339TimeEncoder
+		}
 	}
 
 	level, err := zap.ParseAtomicLevel(logLevel)
@@ -153,19 +152,6 @@ func setUpPprof(logger *zap.Logger, pprof string, debug bool) {
 
 	// this has to be wrapped into a lambda bc otherwise it blocks when evaluating argument for zap.Error
 	go func() { logger.Warn("pprof server", zap.Error(http.ListenAndServe(pprof, mux))) }()
-}
-
-func cancelOnSignal(logger *zap.Logger, cancel context.CancelFunc) {
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs,
-		syscall.SIGTERM,
-		syscall.SIGABRT,
-		syscall.SIGHUP,
-		syscall.SIGINT,
-	)
-	<-sigs
-	logger.Info("terminating")
-	cancel()
 }
 
 func newReporter(logFormat string, logger *zap.Logger) metrics.Reporter {
