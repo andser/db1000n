@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"flag"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -130,9 +131,7 @@ func (r *Runner) Run(ctx context.Context, logger *zap.Logger) {
 			return
 		}
 
-		if r.reporter != nil {
-			reportMetrics(r.reporter, metric, r.globalJobsCfg.ClientID, logger)
-		}
+		reportMetrics(r.reporter, metric, r.globalJobsCfg.ClientID, logger)
 	}
 }
 
@@ -150,6 +149,20 @@ func nonNilConfigOrDefault(c, defaultConfig *config.RawMultiConfig) *config.RawM
 	}
 
 	return defaultConfig
+}
+
+func computeCount(count int, scaleFactor float64) int {
+	scaledCount := scaleFactor * float64(utils.Max(count, 1))
+	if scaledCount > 1 {
+		return int(scaledCount)
+	}
+
+	// if we have less than 1 goroutine per job we just filter them randomly so that only jobs*scaledCount pass
+	if rand.Float64() < scaledCount { //nolint:gosec // Cryptographically secure random not required
+		return 1
+	}
+
+	return 0
 }
 
 func (r *Runner) runJobs(ctx context.Context, cfg *config.MultiConfig, metric *metrics.Metrics, logger *zap.Logger) (cancel context.CancelFunc) {
@@ -171,12 +184,8 @@ func (r *Runner) runJobs(ctx context.Context, cfg *config.MultiConfig, metric *m
 			continue
 		}
 
-		if cfg.Jobs[i].Count < 1 {
-			cfg.Jobs[i].Count = 1
-		}
-
 		if r.globalJobsCfg.ScaleFactor > 0 {
-			cfg.Jobs[i].Count *= r.globalJobsCfg.ScaleFactor
+			cfg.Jobs[i].Count = computeCount(cfg.Jobs[i].Count, r.globalJobsCfg.ScaleFactor)
 		}
 
 		cfgMap := make(map[string]any)
@@ -208,9 +217,11 @@ func (r *Runner) runJobs(ctx context.Context, cfg *config.MultiConfig, metric *m
 }
 
 func reportMetrics(reporter metrics.Reporter, metric *metrics.Metrics, clientID string, logger *zap.Logger) {
-	reporter.WriteSummary(metric)
+	if reporter != nil && metric != nil {
+		reporter.WriteSummary(metric)
 
-	if err := metrics.ReportStatistics(int64(metric.Sum(metrics.BytesSentStat)), clientID); err != nil {
-		logger.Debug("error reporting statistics", zap.Error(err))
+		if err := metrics.ReportStatistics(int64(metric.Sum(metrics.BytesSentStat)), clientID); err != nil {
+			logger.Debug("error reporting statistics", zap.Error(err))
+		}
 	}
 }
